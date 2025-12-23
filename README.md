@@ -1,56 +1,70 @@
-This README serves as the "Source of Truth" for the **RSE Dynamic DNS Orchestrator**. It is designed to handle the complex networking requirements of WSL2 in **Mirrored Mode**, ensuring that internal Lab resources (`*.rse.local`) and external Internet/VPN resources resolve correctly without manual intervention as you move between different networks.
+### RSE Dynamic DNS Orchestrator: Implementation Guide
+
+This guide provides a "set-and-forget" networking architecture for WSL2 (OpenSUSE Tumbleweed) that enables seamless **Split-DNS**. It ensures internal lab resources (`*.rse.local`) resolve via your private Hyper-V switch, while all other internet and corporate VPN traffic routes dynamically through Windows.
 
 ---
 
-## 1. Architecture Overview
+## 1. Windows Host Standardization (Run Once)
 
-In **Mirrored Mode**, WSL2 mirrors the Windows host's networking stack. This design uses a Linux-side "Orchestrator" to identify the Lab and Internet interfaces via subnet fingerprinting and gateway tracking, then configures `systemd-resolved` to handle split-horizon DNS.
+Before configuring Linux, the Windows 11 host must be standardized to support **Mirrored Mode** and proper **Metric Priority**.
 
----
+### A. Host Configuration (`.wslconfig`)
 
-## 2. Windows Host Configuration
-
-All machines (Desktops, Laptops) must have this configuration to enable the underlying networking features.
-
-**File:** `C:\Users\<Username>\.wslconfig`
+Ensure `%USERPROFILE%\.wslconfig` contains the following settings:
 
 ```ini
 [wsl2]
 # Mirrored mode makes WSL interfaces match Windows interfaces 1:1
 networkingMode=mirrored
-# dnsTunneling allows Windows to handle DNS resolution for corporate VPNs/Wi-Fi
+# dnsTunneling allows Windows to handle DNS for corporate VPNs/Wi-Fi
 dnsTunneling=true
-# hostAddressLoopback allows WSL services to be reachable on your LAN via Host IP
+# hostAddressLoopback allows LAN access to WSL services via Host IP
 hostAddressLoopback=true
 
 ```
 
-*Note: Run `wsl --shutdown` in PowerShell after editing.*
+*After saving, run `wsl --shutdown` in PowerShell.*
+
+### B. Route & Interface Metrics (PowerShell Admin)
+
+Standardize metrics to ensure Windows prioritizes the Internet over the Lab for general traffic.
+
+```powershell
+# Set Wi-Fi to high priority
+Set-NetIPInterface -InterfaceAlias "Wi-Fi" -InterfaceMetric 10
+
+# Set Lab Switch to low priority (prevents "Internet" leaks into the lab)
+Set-NetIPInterface -InterfaceAlias "vEthernet (vSwitch-Dev)" -InterfaceMetric 500
+
+# Set Lab to 'Private' to ensure the Windows Firewall permits DNS traffic
+$Profile = Get-NetConnectionProfile -InterfaceAlias "vEthernet (vSwitch-Dev)"
+Set-NetConnectionProfile -InterfaceIndex $Profile.InterfaceIndex -NetworkCategory Private
+
+```
 
 ---
 
-## 3. Linux Orchestrator Implementation
+## 2. The Linux Orchestrator Implementation
+
+The orchestrator uses **Subnet Fingerprinting** to find the Lab regardless of interface index shuffling (`eth0`, `eth1`, etc.).
 
 ### A. The Orchestrator Script
-
-This script performs environment discovery. It identifies the Lab by the `172.19.2.x` signature and the Internet by the default route. It uses `8.8.8.8` as a "proxy target" to trigger Windows DNS Tunneling.
 
 **Path:** `/usr/local/bin/rse-dns-orchestrator.sh`
 
 ```bash
 #!/bin/bash
 # ==============================================================================
-# RSE DYNAMIC DNS ORCHESTRATOR
+# RSE DYNAMIC DNS ORCHESTRATOR - v2.1
 # ==============================================================================
 
 # 1. Discovery Phase
-# Find Lab by its unique subnet signature
+# Identify Lab by unique subnet (172.19.2.x) and Internet by Default Gateway
 LAB_IF=$(ip -4 -o addr show | grep "172.19.2." | awk '{print $2}' | head -n1)
-# Find Internet by the active Default Gateway
 INET_IF=$(ip -4 route show default | awk '{print $5}' | head -n1)
 
 # 2. Reset Phase
-# Clear previous resolve settings to prevent stale conflicts
+# Clear stale settings from all virtual interfaces
 for i in $(ls /sys/class/net | grep eth); do /usr/bin/resolvectl revert "$i"; done
 
 # 3. Lab Mapping (rse.local)
@@ -62,12 +76,13 @@ fi
 
 # 4. Internet Mapping (Global Fallback)
 if [ -n "$INET_IF" ]; then
-    # Using public IPs here triggers Windows DNS Tunneling to intercept the request
+    # Pointing to 8.8.8.8 triggers the Windows DNS Tunneling driver 
+    # to intercept the port 53 traffic and resolve via the Host stack.
     /usr/bin/resolvectl dns "$INET_IF" 8.8.8.8 1.1.1.1
     /usr/bin/resolvectl domain "$INET_IF" "~."
     /usr/bin/resolvectl default-route "$INET_IF" yes
 
-    # Disable noise protocols that cause hangs/timeouts in corporate environments
+    # Disable noise protocols that cause timeout hangs
     /usr/bin/resolvectl dnssec "$INET_IF" no
     /usr/bin/resolvectl llmnr "$INET_IF" no
     /usr/bin/resolvectl mdns "$INET_IF" no
@@ -78,8 +93,6 @@ fi
 ```
 
 ### B. The Systemd Service
-
-This ensures the orchestrator runs automatically at every boot.
 
 **Path:** `/etc/systemd/system/rse-dns-orchestrator.service`
 
@@ -101,18 +114,20 @@ WantedBy=multi-user.target
 
 ---
 
-## 4. Deployment Instructions (The "Clean Slate" Method)
+## 3. Global Installation Command
 
-Run these commands as **root** to install or overwrite existing configurations:
+Execute this block as **root** to clean up old configurations and deploy the Orchestrator. This ensures a "Clean Slate" environment.
 
 ```bash
-# 1. Set permissions
-chmod +x /usr/local/bin/rse-dns-orchestrator.sh
+# 1. Cleanup old services
+systemctl disable --now rse-split-dns.service 2>/dev/null || true
+rm -f /etc/systemd/system/rse-split-dns.service
 
-# 2. Force systemd-resolved to manage the system DNS
+# 2. Set Permissions and Link Resolver
+chmod +x /usr/local/bin/rse-dns-orchestrator.sh
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
-# 3. Enable and trigger the Orchestrator
+# 3. Enable and Trigger
 systemctl daemon-reload
 systemctl enable --now systemd-resolved
 systemctl enable --now rse-dns-orchestrator.service
@@ -121,26 +136,12 @@ systemctl enable --now rse-dns-orchestrator.service
 
 ---
 
-## 5. Troubleshooting & Verification
+## 4. Verification
 
-### **Verification Commands**
+| Target | Command | Expected Result |
+| --- | --- | --- |
+| **Status** | `resolvectl status` | `~rse.local` on Lab Link; `~.` on Internet Link |
+| **Lab DNS** | `resolvectl query mos01.rse.local` | Resolves via 172.19.2.x (~1.5ms) |
+| **Global DNS** | `resolvectl query www.ibm.com` | Resolves instantly (via Windows Tunnel) |
 
-* **Check Status:** `resolvectl status`
-* *Expectation:* `~rse.local` on the Lab link, `~.` on the Internet link.
-
-
-* **Internal Test:** `resolvectl query mos01.rse.local`
-* *Expectation:* Instant resolution via Lab link.
-
-
-* **Internet Test:** `resolvectl query www.google.com`
-* *Expectation:* Instant resolution via Internet link (intercepted by Windows Tunneling).
-
-
-
-### **Known Fixes**
-
-* **Hang on Internet Queries:** If `www.google.com` hangs, ensure `dnsTunneling=true` is set in `.wslconfig`.
-* **Lab Resolution Fails:** Ensure the Windows Host Firewall permits traffic on the `vSwitch-Dev` (set to "Private" in PowerShell).
-
----
+**Would you like me to add a final "Network Change Listener" to the guide to ensure the orchestrator re-runs automatically when you toggle your VPN?**
