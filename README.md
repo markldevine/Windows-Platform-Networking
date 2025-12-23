@@ -1,52 +1,130 @@
-Dynamic DNS Orchestrator
-========================
-### **The Design: "Zero-Touch" Split DNS for Corporate WSL2**
+This transition represents a move to a high-precision, production-grade networking architecture. By standardizing on the **Orchestrator Pattern**, you are ensuring that your environment is self-healing and "environment-aware," regardless of whether it's running on a stationary desktop or a roaming laptop.
 
-> **Goal:** Resolve internal lab resources (`*.rse.local`) via a private DNS server while routing all other traffic through the Windows/VPN stack, surviving reboots and roaming.
+---
 
-#### **I. Windows Setup (The Foundation)**
+## The Precision Design: RSE Dynamic DNS Orchestrator
 
-Create `%USERPROFILE%\.wslconfig`:
+This design replaces all previous ad-hoc split-DNS attempts. It leverages **Subnet Fingerprinting** to identify your Lab and **Gateway Tracking** to identify your internet path.
+
+### 1. Windows Host Standardization (`.wslconfig`)
+
+This file is the "Master Switch" for the entire architecture. Ensure this is identical across all machines.
+
+**Path:** `%USERPROFILE%\.wslconfig`
 
 ```ini
 [wsl2]
+# Mirrored mode makes WSL interfaces match Windows interfaces 1:1
 networkingMode=mirrored
+# dnsTunneling allows Windows to handle DNS resolution for corporate VPNs/Wi-Fi
 dnsTunneling=true
+# hostAddressLoopback allows your WSL services to be reachable on your LAN
 hostAddressLoopback=true
 
 ```
 
-#### **II. The Linux Logic (The Orchestrator)**
+---
 
-Instead of hardcoding interface names (which shuffle), we detect the environment via the subnet signature.
+### 2. The Implementation Script
 
-**The Script:** `/usr/local/bin/rse-dns-orchestrator.sh`
+This script is idempotent; it can be run as an install script or a repair script. It handles the renaming and deconfliction of the old service automatically.
 
-1. **Revert:** Clears all existing `resolvectl` settings to prevent "Default Route" conflicts.
-2. **Discover Lab:** Looks for the interface on the `172.19.2.0/24` subnet.
-3. **Discover Internet:** Identifies the interface holding the `default` route.
-4. **Map:** * Assigns `~rse.local` to the Lab interface.
-* Assigns `~.` (the wildcard) to the Internet interface.
-* Explicitly sets the Internet interface as the `Default Route`.
+**Run as root in WSL2:**
 
+```bash
+#!/bin/bash
+# ==============================================================================
+# RSE ORCHESTRATOR DEPLOYMENT - PRECISION VERSION
+# ==============================================================================
 
+# 1. Deconflict: Remove the old service if it exists
+echo ">>> Cleaning up previous service: rse-split-dns..."
+systemctl disable --now rse-split-dns.service 2>/dev/null || true
+rm -f /etc/systemd/system/rse-split-dns.service
 
-#### **III. Deployment Steps**
+# 2. Install Logic: Create the Orchestrator Script
+echo ">>> Installing Orchestrator logic to /usr/local/bin/..."
+cat << 'EOF' > /usr/local/bin/rse-dns-orchestrator.sh
+#!/bin/bash
+# Discovery Phase: Identify Lab (172.19.2.x) and Internet (Default Gateway)
+LAB_IF=$(ip -4 -o addr show | grep "172.19.2." | awk '{print $2}' | head -n1)
+INET_IF=$(ip -4 route show default | awk '{print $5}' | head -n1)
+INET_GW=$(ip -4 route show default | awk '{print $3}' | head -n1)
 
-1. **Enable systemd-resolved:** Link the stub resolver to `/etc/resolv.conf`.
-2. **Install Script:** Copy the Orchestrator to `/usr/local/bin/`.
-3. **Automation:** Enable the systemd service to run the script at every boot.
+# Reset: Clear stale Resolve settings for all ethernet interfaces
+for i in $(ls /sys/class/net | grep eth); do /usr/bin/resolvectl revert "$i"; done
+
+# Logic Block: RSE Lab (High Priority/Specificity)
+if [ -n "$LAB_IF" ]; then
+    /usr/bin/resolvectl dns "$LAB_IF" 172.19.2.100 172.19.2.101
+    /usr/bin/resolvectl domain "$LAB_IF" "~rse.local"
+    /usr/bin/resolvectl default-route "$LAB_IF" no
+    echo "Orchestrator: Lab fingerprint detected on $LAB_IF"
+fi
+
+# Logic Block: Global Internet (Authoritative Default Route)
+if [ -n "$INET_IF" ]; then
+    /usr/bin/resolvectl dns "$INET_IF" "$INET_GW"
+    /usr/bin/resolvectl domain "$INET_IF" "~."
+    /usr/bin/resolvectl default-route "$INET_IF" yes
+    # Disable protocols that often trigger "degraded feature set" warnings in corporate LANs
+    /usr/bin/resolvectl dnssec "$INET_IF" no
+    /usr/bin/resolvectl llmnr "$INET_IF" no
+    echo "Orchestrator: Internet gateway detected on $INET_IF via $INET_GW"
+fi
+/usr/bin/resolvectl flush-caches
+EOF
+chmod +x /usr/local/bin/rse-dns-orchestrator.sh
+
+# 3. Service Creation: Create the new Orchestrator System Unit
+echo ">>> Creating rse-dns-orchestrator.service..."
+cat << 'EOF' > /etc/systemd/system/rse-dns-orchestrator.service
+[Unit]
+Description=RSE Dynamic DNS Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rse-dns-orchestrator.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 4. Global Resolver Configuration
+echo ">>> Finalizing clean-slate resolver link..."
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+# 5. Activation
+echo ">>> Activating Orchestrator..."
+systemctl daemon-reload
+systemctl enable --now systemd-resolved
+systemctl enable --now rse-dns-orchestrator.service
+
+echo ">>> Deployment Successful."
+
+```
 
 ---
 
-## 4. The "Outsmarting" Automation (Udev Rule)
+### 3. Architecture Summary for Your Project Documentation
 
-To truly "set it and forget it" on your laptop, we don't need `NetworkManager`. We just need a **Udev rule**. This tells Linux: *"Every time a network interface changes state (like when you wake from sleep or connect a VPN), re-run my Orchestrator script."*
+| Feature | Design Implementation |
+| --- | --- |
+| **Discovery** | Uses `grep "172.19.2."` to find the Lab interface regardless of index shuffling. |
+| **Routing** | Uses `~rse.local` (specific) vs `~.` (wildcard) to implement split-horizon resolution. |
+| **VPN Support** | Inherits `$INET_GW` dynamically, respecting Windows DNS Tunneling. |
+| **Idempotency** | `resolvectl revert` ensures that moving between WiFi networks doesn't leave stale DNS servers behind. |
 
-**Create `/etc/udev/rules.d/99-wsl-dns.rules`:**
+#### **Testing your Precision Build:**
 
-```text
-SUBSYSTEM=="net", ACTION=="add", RUN+="/usr/local/bin/rse-dns-orchestrator.sh"
-SUBSYSTEM=="net", ACTION=="change", RUN+="/usr/local/bin/rse-dns-orchestrator.sh"
+1. **Lab Check:** `resolvectl query mos01.rse.local` (Targeting 172.19.2.x via Lab IF)
+2. **Internet Check:** `resolvectl query www.google.com` (Targeting Windows GW via Internet IF)
 
-```
+If you ever find yourself on a new network and things feel slow, a simple `sudo systemctl restart rse-dns-orchestrator` will re-run the discovery and map the world to your current reality.
+
+[WSL 2 Networking - YouTube](https://www.youtube.com/watch?v=yCK3easuYm4)
+
+This video explains the fundamental shift in WSL2 networking architecture, which helps in understanding why manual overrides are necessary to maintain stable DNS in complex corporate or roaming environments.
